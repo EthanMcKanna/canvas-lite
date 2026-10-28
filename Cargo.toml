@@ -1,0 +1,33 @@
+[package]
+name = "canvas-lite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A fast, minimal desktop client for Canvas LMS: this week, exams, and simplified class pages."
+license = "MIT"
+repository = "https://github.com/EthanMcKanna/canvas-lite"
+readme = "README.md"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+cookie = "0.18.2"
+dirs = "7.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication", "NSResponder"] }
+open = "5.4.5"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "cookies", "gzip", "http2", "json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tao = "0.37.2"
+tray-icon = "0.26.1"
+wry = "0.57.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
