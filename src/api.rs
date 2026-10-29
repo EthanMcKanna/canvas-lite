@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Error text for a browser session Canvas no longer accepts; the app renews on seeing it.
+pub const SESSION_EXPIRED: &str = "Canvas session expired";
+
 pub struct Api {
     base: Url,
     /// Empty when signed in through the browser; then `jar` carries the session.
@@ -353,7 +356,7 @@ impl Api {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(anyhow!(if self.token.is_empty() {
-                "Canvas session expired — sign in again in Settings"
+                SESSION_EXPIRED
             } else {
                 "Canvas rejected the access token (401)"
             }));

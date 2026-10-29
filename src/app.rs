@@ -27,8 +27,27 @@ enum Msg {
     Planner(String, Res<Vec<PlannerItem>>),
     Missing(Res<Vec<Assignment>>),
     Detail(u64, Res<CourseDetail>),
-    Override { week: String, plannable_id: u64, res: Res<PlannerOverride> },
+    Override {
+        week: String,
+        plannable_id: u64,
+        res: Res<PlannerOverride>,
+    },
     Syllabus(u64, Res<Syllabus>),
+    /// A renewed browser session (silent or interactive re-login).
+    Renewed {
+        silent: bool,
+        res: Res<Config>,
+    },
+}
+
+/// Browser-session health. Canvas sessions expire; the school's SSO session usually
+/// outlives them, so renewal is normally invisible.
+#[derive(Clone, Copy, PartialEq)]
+enum Session {
+    Ok,
+    Renewing,
+    /// Silent renewal failed: the user has to sign in again.
+    Expired,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -87,6 +106,8 @@ enum Action {
     /// Open a course on a specific tab.
     CourseTab(u64, Tab),
     RevealGrade(u64),
+    /// Sign in again after the session expired (interactive window).
+    Reauth,
     Refresh,
 }
 
@@ -133,6 +154,8 @@ pub struct App {
     hidden: bool,
     /// Since hiding, the app has been seen in the background (so a later activation is a reopen).
     hidden_went_inactive: bool,
+    session: Session,
+    last_renewal: Option<Instant>,
 }
 
 impl App {
@@ -186,6 +209,8 @@ impl App {
             tray_built: Instant::now(),
             hidden: false,
             hidden_went_inactive: false,
+            session: Session::Ok,
+            last_renewal: None,
         };
         if app.prefs.menu_bar {
             app.tray = Tray::new();
@@ -279,8 +304,8 @@ impl App {
     }
 
     fn handle(&mut self, msg: Msg) {
-        // Syllabus scrapes run on their own worker and aren't counted in `inflight`.
-        if !matches!(msg, Msg::Syllabus(..)) {
+        // Syllabus scrapes and session renewals run on their own and aren't counted in `inflight`.
+        if !matches!(msg, Msg::Syllabus(..) | Msg::Renewed { .. }) {
             self.inflight = self.inflight.saturating_sub(1);
         }
         self.dirty = true;
@@ -358,6 +383,32 @@ impl App {
                     self.syllabus_errors.insert(id, e);
                 }
             },
+            Msg::Renewed { silent, res } => match res {
+                Ok(cfg) => {
+                    if let Err(e) = store::save_config(&cfg) {
+                        eprintln!("canvas-lite: couldn't save renewed session: {e}");
+                    }
+                    self.api = Api::new(&cfg).ok().map(Arc::new);
+                    self.session = Session::Ok;
+                    self.error = None;
+                    self.refresh();
+                }
+                Err(e) => {
+                    self.session = Session::Expired;
+                    if !silent {
+                        self.error = Some(e);
+                    }
+                }
+            },
+            Msg::Me(Err(e))
+            | Msg::Courses(Err(e))
+            | Msg::Planner(_, Err(e))
+            | Msg::Missing(Err(e))
+            | Msg::Detail(_, Err(e))
+                if e.contains(crate::api::SESSION_EXPIRED) =>
+            {
+                self.on_session_expired();
+            }
             Msg::Me(Err(e))
             | Msg::Courses(Err(e))
             | Msg::Planner(_, Err(e))
@@ -599,6 +650,10 @@ impl App {
             _ => d.format("%A, %b %-d").to_string(),
         };
         let mut entries = Vec::new();
+        if self.session == Session::Expired {
+            entries.push(Entry::Item { text: "Sign in to Canvas again…".into(), action: TrayAction::Reauth });
+            entries.push(Entry::Separator);
+        }
         let overdue =
             self.data.missing.iter().filter(|a| a.due_at.is_some_and(|d| d < now.with_timezone(&Utc))).count();
         if overdue > 0 {
@@ -681,6 +736,10 @@ impl App {
                 self.apply(vec![Action::View(View::Upcoming)]);
             }
             TrayAction::Refresh => self.refresh(),
+            TrayAction::Reauth => {
+                self.show_window();
+                self.renew_session(false);
+            }
             TrayAction::Quit => {
                 self.persist();
                 std::process::exit(0);
@@ -777,6 +836,7 @@ impl App {
                 Action::RevealGrade(id) => {
                     self.revealed.insert(id);
                 }
+                Action::Reauth => self.renew_session(false),
                 Action::Refresh => self.refresh(),
                 Action::Toggle { week, plannable_id } => self.toggle(week, plannable_id),
             }
@@ -803,6 +863,33 @@ impl App {
         self.spawn(move |a| Msg::Override { week, plannable_id, res: a.set_complete(&snapshot, done).map_err(err) });
     }
 
+    /// Canvas said our session is gone. Try a silent re-login once (at most every
+    /// few minutes); if that already failed, wait for the user.
+    fn on_session_expired(&mut self) {
+        if self.session != Session::Ok {
+            return;
+        }
+        if self.last_renewal.is_some_and(|t| t.elapsed().as_secs() < 300) {
+            self.session = Session::Expired;
+            return;
+        }
+        self.renew_session(true);
+    }
+
+    fn renew_session(&mut self, silent: bool) {
+        if self.base_url.is_empty() {
+            return;
+        }
+        self.session = Session::Renewing;
+        self.last_renewal = Some(Instant::now());
+        let (tx, ctx, base) = (self.tx.clone(), self.ctx.clone(), self.base_url.clone());
+        std::thread::spawn(move || {
+            let res = run_login(&base, silent).map(|(cfg, _)| cfg);
+            let _ = tx.send(Msg::Renewed { silent, res });
+            ctx.request_repaint();
+        });
+    }
+
     /// Opens the school's login page in a separate WebKit window (see `web.rs`)
     /// and signs in with the session cookies it hands back.
     fn browser_login(&mut self) {
@@ -817,24 +904,7 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.inflight += 1;
         std::thread::spawn(move || {
-            let res = (|| -> Result<(Config, User), String> {
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                let out = std::process::Command::new(exe)
-                    .args(["--login", &base])
-                    .output()
-                    .map_err(|e| format!("Couldn't open the sign-in window: {e}"))?;
-                let line = String::from_utf8_lossy(&out.stdout);
-                let cookies = serde_json::from_str::<serde_json::Value>(line.trim())
-                    .ok()
-                    .and_then(|v| v["cookies"].as_str().map(str::to_string))
-                    .ok_or("Sign-in window was closed before finishing.")?;
-                let cfg = Config { base_url: base, token: String::new(), cookies };
-                let api = Api::new(&cfg).map_err(err)?;
-                let user = api.me().map_err(err)?;
-                // Store the cookies as they stand after that first request.
-                let cfg = Config { cookies: api.cookie_header().unwrap_or(cfg.cookies), ..cfg };
-                Ok((cfg, user))
-            })();
+            let res = run_login(&base, false);
             let _ = tx.send(Msg::Connected(res));
             ctx.request_repaint();
         });
@@ -1029,6 +1099,30 @@ fn scrape_syllabus(api: &Api, label: &str, path: &str) -> Res<Syllabus> {
     }
     let url = v["url"].as_str().map(|u| u.split('?').next().unwrap_or(u).to_string());
     Ok(Syllabus { source: label.to_string(), url, text, fetched_at: Utc::now() })
+}
+
+/// Runs the WebKit login helper and verifies the session it returns.
+/// `silent`: hidden window that only succeeds if the school's SSO session is still valid.
+fn run_login(base: &str, silent: bool) -> Result<(Config, User), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["--login", base]);
+    if silent {
+        cmd.arg("--silent");
+    }
+    let out = cmd.output().map_err(|e| format!("Couldn't open the sign-in window: {e}"))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let cookies = v["cookies"].as_str().map(str::to_string).ok_or(if silent {
+        "Your school sign-in needs you."
+    } else {
+        "Sign-in window was closed before finishing."
+    })?;
+    let cfg = Config { base_url: base.to_string(), token: String::new(), cookies };
+    let api = Api::new(&cfg).map_err(err)?;
+    let user = api.me().map_err(err)?;
+    // Store the cookies as they stand after that first request.
+    let cfg = Config { cookies: api.cookie_header().unwrap_or(cfg.cookies), ..cfg };
+    Ok((cfg, user))
 }
 
 /// "…/external_tools/2042?x" -> "2042"

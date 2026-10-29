@@ -20,19 +20,24 @@ impl App {
                 .frame(Frame::new().fill(p.sidebar).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
                 .show(ui, |ui| self.sidebar(ui, out));
         }
-        egui::CentralPanel::default_margins().frame(Frame::new().fill(p.bg)).show(ui, |ui| match self.view {
-            View::Settings if self.api.is_none() => self.sign_in(ui),
-            View::Settings => self.settings(ui),
-            View::Upcoming => {
-                let mut hide = self.hide_done;
-                self.upcoming(ui, out, &mut hide);
-                self.hide_done = hide;
+        egui::CentralPanel::default_margins().frame(Frame::new().fill(p.bg)).show(ui, |ui| {
+            if self.session == Session::Expired && self.api.is_some() {
+                session_banner(ui, out);
             }
-            View::Calendar => self.calendar(ui, out),
-            View::Course(id) => {
-                let mut filter = std::mem::take(&mut self.syllabus_filter);
-                self.course_view(ui, out, id, &mut filter);
-                self.syllabus_filter = filter;
+            match self.view {
+                View::Settings if self.api.is_none() => self.sign_in(ui),
+                View::Settings => self.settings(ui),
+                View::Upcoming => {
+                    let mut hide = self.hide_done;
+                    self.upcoming(ui, out, &mut hide);
+                    self.hide_done = hide;
+                }
+                View::Calendar => self.calendar(ui, out),
+                View::Course(id) => {
+                    let mut filter = std::mem::take(&mut self.syllabus_filter);
+                    self.course_view(ui, out, id, &mut filter);
+                    self.syllabus_filter = filter;
+                }
             }
         });
     }
@@ -106,7 +111,12 @@ impl App {
         let p = pal(ui);
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
         let dot = pos2(rect.left() + 13.0, rect.center().y);
-        let (label, color) = if self.inflight > 0 {
+        let renewing = self.session == Session::Renewing;
+        let (label, color) = if renewing {
+            ("Reconnecting…".to_string(), p.text3)
+        } else if self.session == Session::Expired {
+            ("Signed out · sign in".to_string(), p.danger)
+        } else if self.inflight > 0 {
             ("Syncing…".to_string(), p.text3)
         } else if self.error.is_some() {
             ("Sync failed · retry".to_string(), p.danger)
@@ -114,14 +124,15 @@ impl App {
             let when = self.data.updated_at.map(ago).unwrap_or_else(|| "never".into());
             (format!("Synced {when}"), p.text3)
         };
-        if self.inflight > 0 {
+        if self.inflight > 0 || renewing {
             // A slow pulse instead of a spinner: quieter in peripheral vision.
             let t = ui.input(|i| i.time) as f32;
             let a = 0.35 + 0.65 * (t * 3.0).sin().abs();
             ui.painter().circle_filled(dot, 3.0, p.text2.gamma_multiply(a));
             ui.ctx().request_repaint();
         } else {
-            ui.painter().circle_filled(dot, 3.0, if self.error.is_some() { p.danger } else { p.text4 });
+            let bad = self.error.is_some() || self.session == Session::Expired;
+            ui.painter().circle_filled(dot, 3.0, if bad { p.danger } else { p.text4 });
         }
         let c = if resp.hovered() { p.text } else { color };
         ui.painter().text(
@@ -138,7 +149,7 @@ impl App {
             None => resp.on_hover_text("Refresh  ·  R"),
         };
         if resp.clicked() {
-            out.push(Action::Refresh);
+            out.push(if self.session == Session::Expired { Action::Reauth } else { Action::Refresh });
         }
     }
 
@@ -911,6 +922,24 @@ impl App {
 }
 
 // ---------- shared pieces ----------
+
+/// Shown above every page once the browser session expired and couldn't renew itself.
+fn session_banner(ui: &mut Ui, out: &mut Vec<Action>) {
+    let p = pal(ui);
+    Frame::new().fill(p.raised).inner_margin(Margin::symmetric(PAD as i8, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(med("Your Canvas session expired.", size::BASE, p.text));
+            ui.label(txt("What you see may be out of date.", size::BASE, p.text3));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::button(ui, "Sign in again", true).clicked() {
+                    out.push(Action::Reauth);
+                }
+            });
+        });
+    });
+    theme::hairline(ui);
+}
 
 /// Top bar of every page: breadcrumb on the left, controls on the right, hairline below.
 /// `crumbs` are (text, is_current).

@@ -1,9 +1,12 @@
 //! Helper WebKit windows, each run as its own process:
 //!
-//! `canvas-lite --login <base-url>`: a sign-in window for schools that
+//! `canvas-lite --login <base-url> [--silent]`: a sign-in window for schools that
 //! don't allow personal access tokens. The user signs in normally (SSO, Duo, …);
 //! once the browser lands back on a Canvas page outside `/login`, the session
-//! cookies are printed to stdout as JSON and the process exits.
+//! cookies are printed to stdout as JSON and the process exits. WebKit keeps the
+//! school's SSO cookies between runs, so `--silent` (hidden window) can usually
+//! renew an expired Canvas session with no interaction; if it can't within a few
+//! seconds it gives up and prints `{"error":"interaction"}`.
 //!
 //! `canvas-lite --extract <url>`: loads a Canvas external-tool page (e.g. Simple
 //! Syllabus) in a hidden window and prints the tool's rendered text.
@@ -18,7 +21,9 @@ use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
-pub fn login(base: &str) {
+pub fn login(base: &str, silent: bool) {
+    const SILENT_TIMEOUT: Duration = Duration::from_secs(25);
+    let started = Instant::now();
     let base = base.trim_end_matches('/').to_string();
     let host = reqwest::Url::parse(&base).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
 
@@ -26,10 +31,13 @@ pub fn login(base: &str) {
     let window = WindowBuilder::new()
         .with_title("Sign in to Canvas")
         .with_inner_size(tao::dpi::LogicalSize::new(920.0, 780.0))
+        .with_visible(!silent)
         .build(&event_loop)
         .expect("login window");
     let webview = WebViewBuilder::new().with_url(format!("{base}/login")).build(&window).expect("webview");
-    window.set_focus();
+    if !silent {
+        window.set_focus();
+    }
 
     let mut next_check = Instant::now();
     event_loop.run(move |event, _, flow| {
@@ -41,6 +49,10 @@ pub fn login(base: &str) {
             return;
         }
         next_check = Instant::now() + Duration::from_millis(400);
+        if silent && started.elapsed() > SILENT_TIMEOUT {
+            println!("{}", serde_json::json!({ "error": "interaction" }));
+            std::process::exit(0);
+        }
 
         let Some(url) = webview.url().ok().and_then(|u| reqwest::Url::parse(&u).ok()) else { return };
         let signed_in = url.host_str() == Some(host.as_str()) && !url.path().starts_with("/login");

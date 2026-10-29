@@ -12,7 +12,11 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     match args.as_slice() {
         [_, flag, base] if flag == "--login" => {
-            web::login(base);
+            web::login(base, false);
+            return Ok(());
+        }
+        [_, flag, base, silent] if flag == "--login" && silent == "--silent" => {
+            web::login(base, true);
             return Ok(());
         }
         [_, flag, url] if flag == "--extract" => {

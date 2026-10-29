@@ -14,6 +14,8 @@ pub enum TrayAction {
     Syllabus(u64),
     ShowWindow,
     Refresh,
+    /// The session expired and silent renewal failed: sign in again.
+    Reauth,
     Quit,
 }
 
